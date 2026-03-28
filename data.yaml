@@ -1,0 +1,11 @@
+# Path to your dataset
+path: dataset  # dataset root dir
+train: images  # train images (relative to 'path')
+val: images    # val images (we are using the same images for validation for now)
+
+# Classes
+names:
+  0: slowdown
+  1: speedlimit
+  2: workinprogress
+  3: crossing
