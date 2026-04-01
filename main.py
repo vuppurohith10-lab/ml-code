@@ -1,31 +1,49 @@
 import cv2
 import time
-import json
+import socket
 from ultralytics import YOLO
+from collections import deque
 
-# Load trained model
+# ---------------- SOCKET SETUP ----------------
+PI_IP = "192.168.1.7"
+PORT = 5000
+
+client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+try:
+    client.connect((PI_IP, PORT))
+    print("✅ Connected to Raspberry Pi")
+except:
+    print("❌ Could not connect to Pi")
+    exit()
+
+# ---------------- LOAD MODEL ----------------
 model = YOLO("runs/detect/train/weights/best.pt")
 
-# Open camera
+# ---------------- CAMERA ----------------
 cap = cv2.VideoCapture(0)
 
-# Timing + stability
-last_action_time = 0
-cooldown = 3  # seconds
+# ---------------- SETTINGS ----------------
 required_frames = 3
+cooldown = 1
 
 detection_history = {}
+last_action_time = 0
 last_label = None
 
-# Output file (QNX will read this)
-output_file = "detection.json"
+# Buffer for smoothing
+label_buffer = deque(maxlen=5)
 
+# Output files
+log_file = "detection_log.txt"
+latest_file = "latest.txt"
+
+# ---------------- MAIN LOOP ----------------
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    # Run detection
     results = model(frame, conf=0.7, imgsz=320)
 
     current_labels = []
@@ -36,81 +54,91 @@ while True:
             cls = int(box.cls[0])
             label = model.names[cls]
 
-            # Ignore weak detections
             if conf < 0.7:
                 continue
 
-            # Get bounding box
             x1, y1, x2, y2 = box.xyxy[0]
             area = (x2 - x1) * (y2 - y1)
 
-            # Ignore small (background) detections
             if area < 5000:
                 continue
 
             current_labels.append(label)
 
-            # Stability check (multi-frame detection)
+            # Frame stability check
             detection_history[label] = detection_history.get(label, 0) + 1
-
             if detection_history[label] < required_frames:
                 continue
 
+            # Add to buffer
+            label_buffer.append(label)
+
+            # Majority voting
+            final_label = max(set(label_buffer), key=label_buffer.count)
+
             current_time = time.time()
 
-            # Cooldown + avoid duplicate writes
-            if current_time - last_action_time > cooldown and label != last_label:
+            if current_time - last_action_time > cooldown:
 
-                # Define action logic
-                if label == "slowdown":
-                    action = "reduce_speed"
+                # -------- ACTION LOGIC --------
+                if final_label == "slowdown":
+                    action = "notify_only"
+                    speed = None
+
+                elif final_label == "speedlimit":
+                    action = "set_speed"
                     speed = 30
 
-                elif label == "speedlimit":
-                    action = "set_speed"
-                    speed = 40
+                elif final_label == "crossing":
+                    action = "notify_only"
+                    speed = None
 
-                elif label == "crossing":
-                    action = "reduce_speed"
-                    speed = 25
-
-                elif label == "workinprogress":
+                elif final_label == "workinprogress":
                     action = "reduce_speed"
                     speed = 20
 
                 else:
                     continue
 
-                # Final data (QNX readable)
-                data = {
-                    "label": label,
-                    "confidence": round(conf, 2),
-                    "action": action,
-                    "target_speed": speed,
-                    "timestamp": int(current_time)
-                }
+                # -------- LOG FORMAT --------
+                log_line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {final_label} | Conf:{round(conf,2)} | Action:{action} | Speed:{speed}\n"
 
-                # 🔥 REAL-TIME WRITE (LATEST ONLY)
-                with open(output_file, "w") as f:
-                    json.dump(data, f)
+                # Write latest
+                with open(latest_file, "w") as f:
+                    f.write(log_line)
                     f.flush()
 
-                print("✅ SENT:", data)
+                # Write history
+                with open(log_file, "a") as f:
+                    f.write(log_line)
+                    f.flush()
+
+                # -------- SEND TO PI --------
+                try:
+                    client.send((final_label + "\n").encode())
+                    print("📡 SENT TO PI:", final_label)
+                except:
+                    print("❌ Connection lost")
+                    break
+
+                print("✅ LOG:", log_line.strip())
 
                 last_action_time = current_time
-                last_label = label
+                last_label = final_label
 
     # Reset missing detections
     for key in list(detection_history.keys()):
         if key not in current_labels:
             detection_history[key] = 0
 
-    # Show detection window
+    # Display
     annotated = results[0].plot()
     cv2.imshow("Traffic Detection", annotated)
 
     if cv2.waitKey(1) == 27:
         break
 
+# ---------------- CLEANUP ----------------
 cap.release()
 cv2.destroyAllWindows()
+client.close()
